@@ -329,8 +329,8 @@ def validate_candidates_at_fix(
     points_frames: List[np.ndarray],
     gt: Optional[Tuple[float, float, float]] = None
 ) -> List[ValidResult]:
-    if not frames: return []
-    merged = np.vstack(frames)
+    if not points_frames: return []
+    merged = np.vstack(points_frames)
     merged = voxel_downsample(merged)
 
     results = []
