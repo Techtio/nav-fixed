@@ -249,21 +249,36 @@ def score_candidate(right: StripMetrics, back: StripMetrics) -> Tuple[float, str
 
 # ═══ Real candidate acquisition ═══
 
-def get_real_candidates(seed: int, attempt: int):
-    """Call corner_localizer detection → return (candidates, pointcloud_frames).
-    Pointcloud frames come from the same /lidar/points source, TF'd to base_link.
-    """
+def get_real_candidates(seed: int, attempt: int, restart_sim: bool = False):
+    """If restart_sim: use SimLauncher to spawn at seed position, then detect.
+    Otherwise: just re-detect (SimLauncher already running from first attempt)."""
+    import rospy, subprocess as sp
+
+    if restart_sim:
+        # Kill any existing processes
+        sp.run(['pkill', '-f', 'rosmaster'], capture_output=True)
+        sp.run(['pkill', '-f', 'roslaunch'], capture_output=True)
+        sp.run(['pkill', '-f', 'nodelet_manager'], capture_output=True)
+        time.sleep(5)
+
+        sys.path.insert(0, '/root/kuavo_ws/src/craic_simulator/utils')
+        sys.path.insert(0, '/root/kuavo_ws/src/craic_simulator/lib')
+        from sim_launcher import SimLauncher
+        launcher = SimLauncher(scene="scene1", seed=seed, robot_version=52)
+        launcher.start(node_name=f"fix_val_s{seed}", timeout=180)
+        print(f"[FIX_VAL] SimLauncher seed={seed} started")
+        time.sleep(8)  # let MuJoCo + TF stabilize
+
+    # Now corner_localizer detection
     sys.path.insert(0, '/tmp/nav_test')
     sys.path.insert(0, '/root/kuavo_ws/src/craic_simulator/utils')
     sys.path.insert(0, '/root/kuavo_ws/src/craic_simulator/lib')
     import corner_localizer as cl
 
-    # 1. Collect cloud just like corner_localizer does
     xy_vox, xy3_filt, angles, ranges = cl.collect_base_link_cloud(n_frames=N_FRAMES)
     if xy_vox is None or len(xy_vox) < 30:
         return [], []
 
-    # 2. Detect lines and generate all candidates (same as corner_localizer)
     lines = cl.detect_lines(xy_vox, xy3_filt)
     if len(lines) < 2: return [], []
     pairs, _ = cl.find_orthogonal_pairs(lines)
@@ -277,24 +292,18 @@ def get_real_candidates(seed: int, attempt: int):
     all_cands_raw.sort(key=lambda c: -c['score'])
     top20 = all_cands_raw[:20]
 
-    # Convert to our Candidate type
     candidates = []
     for i, c in enumerate(top20):
-        candidates.append(Candidate(
-            id=i, x=c['x'], y=c['y'], yaw=c['yaw'],
-            source="corner", orig_score=c['score']
-        ))
+        candidates.append(Candidate(id=i, x=c['x'], y=c['y'], yaw=c['yaw'],
+                                    source="corner", orig_score=c['score']))
 
-    # Re-collect raw pointcloud frames (same source, for FIX validation)
-    import rospy
+    # Collect fresh pointcloud frames
+    import tf2_ros, tf.transformations as tft
     from sensor_msgs.msg import PointCloud2
     import sensor_msgs.point_cloud2 as pc2
-    import tf2_ros, tf.transformations as tft
     tf_buffer = tf2_ros.Buffer()
     tf_listener = tf2_ros.TransformListener(tf_buffer)
-    rospy.sleep(0.3)
-
-    # Cache radar→base_link TF
+    rospy.sleep(0.5)
     tf_trans, tf_rot = None, None
     try:
         t = tf_buffer.lookup_transform('base_link', 'radar', rospy.Time(0), rospy.Duration(2.0))
@@ -302,7 +311,6 @@ def get_real_candidates(seed: int, attempt: int):
         q = t.transform.rotation
         tf_rot = tft.quaternion_matrix([q.x, q.y, q.z, q.w])[:3, :3]
     except: pass
-
     frames = []
     for _ in range(N_FRAMES):
         try:
@@ -318,12 +326,6 @@ def get_real_candidates(seed: int, attempt: int):
             rospy.sleep(0.1)
         except: continue
     return candidates, frames
-
-
-# ═══ Validate ═══
-
-# ═══ Main validator entry point ═══
-
 def validate_candidates_at_fix(
     candidates: List[Candidate],
     points_frames: List[np.ndarray],
@@ -428,11 +430,96 @@ def main():
         for row in all_rows: f.write(json.dumps(row) + '\n')
 
     print(f"\n{'='*60}")
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument('--seed', type=int, default=0)
+    ap.add_argument('--seeds', type=str, default=None)
+    ap.add_argument('--attempts', type=int, default=3)
+    args = ap.parse_args()
+
+    seeds = [args.seed]
+    if args.seeds: seeds = [int(s.strip()) for s in args.seeds.split(',')]
+
+    log_dir = '/tmp/nav_test/logs'
+    os.makedirs(log_dir, exist_ok=True)
+    csv_path = os.path.join(log_dir, 'fix_validator.csv')
+    jsonl_path = os.path.join(log_dir, 'fix_validator.jsonl')
+
+    cols = ['seed', 'attempt', 'candidate_id', 'source', 'x', 'y', 'yaw_deg',
+            'orig_score', 'right_count', 'right_med', 'right_p90', 'right_span',
+            'right_density', 'right_ok', 'back_count', 'back_med', 'back_p90',
+            'back_span', 'back_density', 'back_ok', 'fix_score', 'selected',
+            'reject_reason', 'gt_x', 'gt_y', 'gt_yaw_deg', 'pos_err', 'yaw_err_deg']
+
+    all_rows, correct, total = [], 0, 0
+
+    # Import once for GT_POSES
+    sys.path.insert(0, '/tmp/nav_test')
+    import corner_localizer as cl_ref
+    GT_POSES = getattr(cl_ref, 'GT_POSES', {})
+
+    for seed in seeds:
+        # Restart simulation at this seed position (first attempt)
+        cands, frames = get_real_candidates(seed, 1, restart_sim=True)
+
+        for a in range(args.attempts):
+            if a > 0:
+                # Subsequent attempts: re-detect without restarting sim
+                cands, frames = get_real_candidates(seed, a + 1, restart_sim=False)
+
+            if len(frames) < 3 or not cands:
+                print(f"  seed={seed} attempt={a+1}: frames={len(frames)} cands={len(cands)} SKIP")
+                continue
+
+            gt = GT_POSES.get(seed, None)
+            results = validate_candidates_at_fix(cands, frames, gt)
+            total += 1
+
+            sel = [r for r in results if r.selected]
+            print(f"\n── seed={seed} attempt={a+1}  {len(results)} candidates  "
+                  f"selected={'#'+str(sel[0].candidate.id) if sel else 'NONE'} ──")
+
+            for r in results:
+                all_rows.append(r.row_dict(seed, a + 1))
+                mark = " ★" if r.selected else ""
+                perr = f"pos={r.pos_err:.3f}" if r.pos_err else ""
+                yerr = f"yaw={math.degrees(r.yaw_err):.1f}°" if r.yaw_err else ""
+                print(f"  [{r.candidate.id}] R(n={r.right.count} med={r.right.med_residual:.3f} "
+                      f"sp={r.right.span:.2f} ok={r.right.ok})  "
+                      f"B(n={r.back.count} med={r.back.med_residual:.3f} "
+                      f"sp={r.back.span:.2f} ok={r.back.ok})  "
+                      f"score={r.fix_score:.1f}  {perr} {yerr}{mark}")
+
+            if sel:
+                best = sel[0]
+                if best.pos_err is not None and best.yaw_err is not None:
+                    if best.pos_err < 0.25 and best.yaw_err < 0.17:
+                        correct += 1
+            else:
+                print(f"  ⚠ NO CANDIDATE PASSED both right_ok AND back_ok — FAIL")
+                print(f"  Failure analysis:")
+                for r in results:
+                    print(f"    [{r.candidate.id}] right_ok={r.right.ok} back_ok={r.back.ok} "
+                          f"R(n={r.right.count} med={r.right.med_residual:.3f} sp={r.right.span:.2f}) "
+                          f"B(n={r.back.count} med={r.back.med_residual:.3f} sp={r.back.span:.2f})")
+
+        # Kill sim before next seed
+        import subprocess as sp
+        sp.run(['pkill', '-f', 'rosmaster'], capture_output=True)
+        sp.run(['pkill', '-f', 'roslaunch'], capture_output=True)
+        sp.run(['pkill', '-f', 'nodelet_manager'], capture_output=True)
+        time.sleep(5)
+
+    with open(csv_path, 'w', newline='') as f:
+        w = csv.DictWriter(f, fieldnames=cols, extrasaction='ignore')
+        w.writeheader(); w.writerows(all_rows)
+    with open(jsonl_path, 'w') as f:
+        for row in all_rows: f.write(json.dumps(row) + '\n')
+
+    print(f"\n{'='*60}")
     if total:
         print(f"  ACCURACY: {correct}/{total}  (pos_err<0.25m & yaw_err<10°)")
     print(f"  Total tests: {total}  Logs: {csv_path}  {jsonl_path}")
     print(f"{'='*60}")
-
-
 if __name__ == '__main__':
     main()
