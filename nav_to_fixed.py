@@ -3,8 +3,11 @@
 Clean navigation: go from current position to a fixed goal.
 Uses gap-seeking + rectangular collision box for obstacle avoidance.
 No button pressing, no arm control — pure walk.
+
+Optional: integrate fixed_pose_validator to filter corner_localizer candidates
+before navigation. Use --validate flag.
 """
-import sys, os, time, math, subprocess, rospy
+import sys, os, time, math, subprocess, rospy, argparse
 from geometry_msgs.msg import Twist, PoseStamped
 from nav_msgs.msg import Odometry, Path
 from sensor_msgs.msg import LaserScan
@@ -109,6 +112,43 @@ def collision_box(scan):
     except:
         pass
     return False
+
+# ─── Go to goal ───
+# ─── Optional: FIX geometry validation before navigating ───
+def run_fix_validation():
+    """Run fixed_pose_validator to filter candidates. Returns True if valid."""
+    from fixed_pose_validator import (
+        get_real_candidates, validate_candidates_at_fix, Candidate
+    )
+    seed = int(time.time()) % 100
+    cands, frames = get_real_candidates(seed, 1)
+    if len(frames) < 3 or not cands:
+        print("FIX_VALIDATOR: insufficient frames, fallback to raw nav")
+        return True  # fallback — let raw nav try
+
+    results = validate_candidates_at_fix(cands, frames)
+    valid = [r for r in results if r.selected]
+    if not valid:
+        print("FIX_VALIDATOR: NO candidate passed both right_ok AND back_ok — FAIL")
+        for r in results[:5]:
+            print(f"  cand[{r.candidate.id}] R(ok={r.right.ok} n={r.right.count}) "
+                  f"B(ok={r.back.ok} n={r.back.count}) score={r.fix_score:.1f}")
+        return False
+
+    best = valid[0]
+    print(f"FIX_VALIDATOR: selected cand[{best.candidate.id}] "
+          f"pos=({best.candidate.x:.3f},{best.candidate.y:.3f}) yaw={best.candidate.yaw_deg:.1f}°")
+    return True
+
+# Parse CLI
+ap = argparse.ArgumentParser()
+ap.add_argument('--validate', action='store_true', help='Run FIX geometry validation first')
+args_cli, _ = ap.parse_known_args()
+
+if args_cli.validate:
+    if not run_fix_validation():
+        print("FIX validation failed — aborting navigation")
+        sys.exit(1)
 
 # ─── Go to goal ───
 x0, y0, _ = get_pose()

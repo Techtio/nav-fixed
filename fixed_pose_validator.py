@@ -28,7 +28,7 @@ BACK_TARGET  = -(EAST_X - FIX_X)    # -1.24
 STRIP_HALF = 0.12
 MIN_RIGHT_COUNT = 800
 MIN_BACK_COUNT  = 500
-MAX_MED_RESIDUAL = 0.06
+MAX_MED_RESIDUAL = 0.05
 MIN_RIGHT_SPAN = 0.6
 MIN_BACK_SPAN  = 0.5
 MIN_DENSITY_BINS = 3
@@ -249,8 +249,10 @@ def score_candidate(right: StripMetrics, back: StripMetrics) -> Tuple[float, str
 
 # ═══ Real candidate acquisition ═══
 
-def get_real_candidates(seed: int, attempt: int) -> Tuple[List[Candidate], List[np.ndarray]]:
-    """Call corner_localizer detection → return Candidate list + pointcloud frames."""
+def get_real_candidates(seed: int, attempt: int):
+    """Call corner_localizer detection → return (candidates, pointcloud_frames).
+    Pointcloud frames come from the same /lidar/points source, TF'd to base_link.
+    """
     sys.path.insert(0, '/tmp/nav_test')
     sys.path.insert(0, '/root/kuavo_ws/src/craic_simulator/utils')
     sys.path.insert(0, '/root/kuavo_ws/src/craic_simulator/lib')
@@ -283,15 +285,33 @@ def get_real_candidates(seed: int, attempt: int) -> Tuple[List[Candidate], List[
             source="corner", orig_score=c['score']
         ))
 
-    # Return raw pointcloud frames for FIX validation
+    # Re-collect raw pointcloud frames (same source, for FIX validation)
     import rospy
     from sensor_msgs.msg import PointCloud2
     import sensor_msgs.point_cloud2 as pc2
+    import tf2_ros, tf.transformations as tft
+    tf_buffer = tf2_ros.Buffer()
+    tf_listener = tf2_ros.TransformListener(tf_buffer)
+    rospy.sleep(0.3)
+
+    # Cache radar→base_link TF
+    tf_trans, tf_rot = None, None
+    try:
+        t = tf_buffer.lookup_transform('base_link', 'radar', rospy.Time(0), rospy.Duration(2.0))
+        tf_trans = np.array([t.transform.translation.x, t.transform.translation.y, t.transform.translation.z])
+        q = t.transform.rotation
+        tf_rot = tft.quaternion_matrix([q.x, q.y, q.z, q.w])[:3, :3]
+    except: pass
+
     frames = []
     for _ in range(N_FRAMES):
         try:
             msg = rospy.wait_for_message('/lidar/points', PointCloud2, timeout=2.0)
             pts = np.array(list(pc2.read_points(msg, field_names=('x', 'y', 'z'), skip_nans=True)))
+            if len(pts) == 0: continue
+            fid = msg.header.frame_id
+            if fid and fid != 'base_link' and tf_rot is not None:
+                pts[:, :3] = pts[:, :3] @ tf_rot.T + tf_trans
             r = np.sqrt(pts[:, 0]**2 + pts[:, 1]**2)
             pts = pts[(r > R_MIN) & (r < R_MAX)]
             if len(pts) > 0: frames.append(pts)
@@ -302,8 +322,13 @@ def get_real_candidates(seed: int, attempt: int) -> Tuple[List[Candidate], List[
 
 # ═══ Validate ═══
 
-def validate(candidates: List[Candidate], frames: List[np.ndarray],
-             gt: Optional[Tuple[float, float, float]] = None) -> List[ValidResult]:
+# ═══ Main validator entry point ═══
+
+def validate_candidates_at_fix(
+    candidates: List[Candidate],
+    points_frames: List[np.ndarray],
+    gt: Optional[Tuple[float, float, float]] = None
+) -> List[ValidResult]:
     if not frames: return []
     merged = np.vstack(frames)
     merged = voxel_downsample(merged)
@@ -352,6 +377,11 @@ def main():
 
     all_rows, correct, total = [], 0, 0
 
+    # Import once for GT_POSES
+    sys.path.insert(0, '/tmp/nav_test')
+    import corner_localizer as cl_ref
+    GT_POSES = getattr(cl_ref, 'GT_POSES', {})
+
     for seed in seeds:
         for a in range(args.attempts):
             cands, frames = get_real_candidates(seed, a + 1)
@@ -359,8 +389,8 @@ def main():
                 print(f"  seed={seed} attempt={a+1}: frames={len(frames)} cands={len(cands)} SKIP")
                 continue
 
-            gt = None  # production mode — GT not used for selection
-            results = validate(cands, frames, gt)
+            gt = GT_POSES.get(seed, None)
+            results = validate_candidates_at_fix(cands, frames, gt)
             total += 1
 
             sel = [r for r in results if r.selected]
@@ -370,15 +400,26 @@ def main():
             for r in results:
                 all_rows.append(r.row_dict(seed, a + 1))
                 mark = " ★" if r.selected else ""
+                perr = f"pos={r.pos_err:.3f}" if r.pos_err else ""
+                yerr = f"yaw={math.degrees(r.yaw_err):.1f}°" if r.yaw_err else ""
                 print(f"  [{r.candidate.id}] R(n={r.right.count} med={r.right.med_residual:.3f} "
                       f"sp={r.right.span:.2f} ok={r.right.ok})  "
                       f"B(n={r.back.count} med={r.back.med_residual:.3f} "
-                      f"sp={r.back.span:.2f} ok={r.back.ok})  score={r.fix_score:.1f}{mark}")
+                      f"sp={r.back.span:.2f} ok={r.back.ok})  "
+                      f"score={r.fix_score:.1f}  {perr} {yerr}{mark}")
 
-            if not sel:
-                print(f"  ⚠ NO CANDIDATE PASSED both right_ok AND back_ok — returning FAIL")
+            if sel:
+                best = sel[0]
+                if best.pos_err is not None and best.yaw_err is not None:
+                    if best.pos_err < 0.25 and best.yaw_err < 0.17:
+                        correct += 1
+            else:
+                print(f"  ⚠ NO CANDIDATE PASSED both right_ok AND back_ok — FAIL")
+                print(f"  Failure analysis:")
                 for r in results:
-                    print(f"    [{r.candidate.id}] {r.reject_reason}")
+                    print(f"    [{r.candidate.id}] right_ok={r.right.ok} back_ok={r.back.ok} "
+                          f"R(n={r.right.count} med={r.right.med_residual:.3f} sp={r.right.span:.2f}) "
+                          f"B(n={r.back.count} med={r.back.med_residual:.3f} sp={r.back.span:.2f})")
 
     with open(csv_path, 'w', newline='') as f:
         w = csv.DictWriter(f, fieldnames=cols, extrasaction='ignore')
@@ -387,6 +428,8 @@ def main():
         for row in all_rows: f.write(json.dumps(row) + '\n')
 
     print(f"\n{'='*60}")
+    if total:
+        print(f"  ACCURACY: {correct}/{total}  (pos_err<0.25m & yaw_err<10°)")
     print(f"  Total tests: {total}  Logs: {csv_path}  {jsonl_path}")
     print(f"{'='*60}")
 
