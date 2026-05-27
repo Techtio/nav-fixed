@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
-fixed_pose_validator.py — Production candidate selector using FIX-point geometry.
+fixed_pose_validator.py — Dominant-peak FIX-point candidate validator.
 
-Calls corner_localizer for top20 candidates, then validates each with
-FIX-frame wall positions (RIGHT y=-1.00, BACK x=-1.24).
+v3: Geometric-error-first scoring. Count capped. AMBIGUOUS rejection.
+Peak position determines wall_ok, not raw residual.  
+NO_SEL > wrong selection.
 
 Usage:
-  python3 fixed_pose_validator.py --seed 0 --attempts 3
   python3 fixed_pose_validator.py --seeds 0,7,13,31,42 --attempts 3
 """
 
@@ -16,70 +16,65 @@ from typing import List, Optional, Tuple
 import numpy as np
 
 # ═══ Constants ═══
-FIX_X = 5.01
-FIX_Y = 3.50
-FIX_YAW = math.pi
+FIX_X   = 5.01;  FIX_Y   = 3.50;  FIX_YAW = math.pi
+NORTH_Y = 4.50;  EAST_X  = 6.25
+RIGHT_TARGET = -1.00   # FIX view: y of north wall
+BACK_TARGET  = -1.24   # FIX view: x of east wall
 
-NORTH_Y = 4.50
-EAST_X = 6.25
-RIGHT_TARGET = -(NORTH_Y - FIX_Y)   # -1.00
-BACK_TARGET  = -(EAST_X - FIX_X)    # -1.24
-
+PEAK_SEARCH_HALF = 0.45
+PEAK_BIN = 0.02
 STRIP_HALF = 0.12
+
+RIGHT_PEAK_ERR_MAX = 0.10
+BACK_PEAK_ERR_MAX  = 0.10
 MIN_RIGHT_COUNT = 800
 MIN_BACK_COUNT  = 500
-MAX_MED_RESIDUAL = 0.05
-MIN_RIGHT_SPAN = 0.6
-MIN_BACK_SPAN  = 0.5
-MIN_DENSITY_BINS = 3
+MIN_WALL_SPAN   = 0.60
 
-N_FRAMES = 5
-VOXEL_SIZE = 0.03
-R_MIN = 0.35
-R_MAX = 20.0
+MIN_SCORE_MARGIN = 8.0   # reject if top1-top2 < this
+
+N_FRAMES    = 5
+VOXEL_SIZE  = 0.03
+R_MIN       = 0.35
+R_MAX       = 20.0
 
 # ═══ Data ═══
 
 @dataclass
 class Candidate:
-    id: int
-    x: float
-    y: float
-    yaw: float
-    source: str = ""
-    orig_score: float = 0.0
-
+    id: int;  x: float;  y: float;  yaw: float
+    source: str = "";  orig_score: float = 0.0
     @property
     def yaw_deg(self): return math.degrees(self.yaw) % 360
 
-
 @dataclass
-class StripMetrics:
-    count: int = 0
-    med_residual: float = 999.0
-    p90_residual: float = 999.0
-    span: float = 0.0
-    density_bins: int = 0
+class WallMetrics:
     ok: bool = False
-
+    peak: Optional[float] = None
+    peak_err: float = 999.0
+    count: int = 0
+    med: float = 999.0
+    p90: float = 999.0
+    span: float = 0.0
+    density: float = 0.0
 
 @dataclass
 class ValidResult:
     candidate: Candidate
-    right: StripMetrics = field(default_factory=StripMetrics)
-    back: StripMetrics = field(default_factory=StripMetrics)
+    right: WallMetrics = field(default_factory=WallMetrics)
+    back:  WallMetrics = field(default_factory=WallMetrics)
     fix_score: float = 0.0
     selected: bool = False
     reject_reason: str = ""
     gt_x: Optional[float] = None
     gt_y: Optional[float] = None
     gt_yaw: Optional[float] = None
+    gt_ok: bool = False
 
     @property
     def pos_err(self):
         if self.gt_x is None: return None
         return math.hypot(self.candidate.x - self.gt_x, self.candidate.y - self.gt_y)
-
     @property
     def yaw_err(self):
         if self.gt_yaw is None: return None
@@ -93,18 +88,17 @@ class ValidResult:
             "x": round(self.candidate.x, 4), "y": round(self.candidate.y, 4),
             "yaw_deg": round(self.candidate.yaw_deg, 2),
             "orig_score": round(self.candidate.orig_score, 4),
+            "right_peak": round(self.right.peak, 4) if self.right.peak else None,
+            "right_peak_err": round(self.right.peak_err, 4),
             "right_count": self.right.count,
-            "right_med": round(self.right.med_residual, 4),
-            "right_p90": round(self.right.p90_residual, 4),
-            "right_span": round(self.right.span, 3),
-            "right_density": self.right.density_bins, "right_ok": self.right.ok,
+            "right_ok": self.right.ok,
+            "back_peak": round(self.back.peak, 4) if self.back.peak else None,
+            "back_peak_err": round(self.back.peak_err, 4),
             "back_count": self.back.count,
-            "back_med": round(self.back.med_residual, 4),
-            "back_p90": round(self.back.p90_residual, 4),
-            "back_span": round(self.back.span, 3),
-            "back_density": self.back.density_bins, "back_ok": self.back.ok,
+            "back_ok": self.back.ok,
             "fix_score": round(self.fix_score, 2), "selected": self.selected,
             "reject_reason": self.reject_reason,
+            "gt_ok": self.gt_ok,
         }
         if self.gt_x is not None:
             r.update({"gt_x": round(self.gt_x, 4), "gt_y": round(self.gt_y, 4),
@@ -114,67 +108,78 @@ class ValidResult:
         return r
 
 
-# ═══ Point cloud (reuses corner_localizer's approach) ═══
+# ═══ Dominant Peak ═══
 
-def collect_base_link_frames(n: int = N_FRAMES) -> List[np.ndarray]:
-    """Collect N /lidar/points frames, each TF'd to base_link.
+def dominant_wall_peak(pts_fix, axis, target, along_axis):
+    empty = lambda: {"ok": False, "peak": None, "peak_err": 999.0,
+                     "count": 0, "med": 999.0, "p90": 999.0, "span": 0.0, "density": 0.0}
+    if pts_fix is None or len(pts_fix) < 50: return empty()
+    coord = pts_fix[:, axis]
+    mask = np.abs(coord - target) <= PEAK_SEARCH_HALF
+    pts = pts_fix[mask]
+    if len(pts) < 50:
+        return {"ok": False, "peak": None, "peak_err": 999.0, "count": len(pts),
+                "med": 999.0, "p90": 999.0, "span": 0.0, "density": 0.0}
+    vals = pts[:, axis]
+    bins = np.arange(target - PEAK_SEARCH_HALF, target + PEAK_SEARCH_HALF + PEAK_BIN, PEAK_BIN)
+    hist, edges = np.histogram(vals, bins=bins)
+    kernel = np.ones(5, dtype=float) / 5.0
+    smooth = np.convolve(hist, kernel, mode="same")
+    idx = int(np.argmax(smooth))
+    peak = 0.5 * (edges[idx] + edges[idx + 1])
+    peak_err = abs(peak - target)
+    strip = np.abs(pts[:, axis] - peak) <= STRIP_HALF
+    wall_pts = pts[strip]
+    if len(wall_pts) == 0:
+        return {"ok": False, "peak": float(peak), "peak_err": float(peak_err),
+                "count": 0, "med": 999.0, "p90": 999.0, "span": 0.0, "density": 0.0}
+    residual = np.abs(wall_pts[:, axis] - target)
+    count = int(len(wall_pts))
+    med = float(np.median(residual))
+    p90 = float(np.percentile(residual, 90))
+    along = wall_pts[:, along_axis]
+    span = float(np.percentile(along, 90) - np.percentile(along, 10))
+    density = count / max(span, 0.1)
+    return {"ok": False, "peak": float(peak), "peak_err": float(peak_err),
+            "count": count, "med": med, "p90": p90, "span": span, "density": float(density)}
 
-    Same approach as corner_localizer: uses tf2_ros to transform from
-    radar → base_link via lookup_transform.
-    """
-    import rospy
-    from sensor_msgs.msg import PointCloud2
-    import sensor_msgs.point_cloud2 as pc2
-    import tf2_ros, tf2_geometry_msgs
-    import tf.transformations as tft
 
-    tf_buffer = tf2_ros.Buffer()
-    tf_listener = tf2_ros.TransformListener(tf_buffer)
-    rospy.sleep(0.5)
+def score_fix_view(pts_fix):
+    """Geometric-error-first scoring. Count capped, peak_err dominates."""
+    right = dominant_wall_peak(pts_fix, axis=1, target=RIGHT_TARGET, along_axis=0)
+    back  = dominant_wall_peak(pts_fix, axis=0, target=BACK_TARGET,  along_axis=1)
 
-    # Cache TF for radar → base_link
-    tf_trans, tf_rot = None, None
-    try:
-        t = tf_buffer.lookup_transform('base_link', 'radar', rospy.Time(0), rospy.Duration(2.0))
-        tf_trans = np.array([t.transform.translation.x, t.transform.translation.y, t.transform.translation.z])
-        q = t.transform.rotation
-        tf_rot = tft.quaternion_matrix([q.x, q.y, q.z, q.w])[:3, :3]
-    except Exception as e:
-        pass  # lidar_frame may already be base_link
+    right_ok = (right["peak_err"] <= RIGHT_PEAK_ERR_MAX
+                and right["count"] >= MIN_RIGHT_COUNT
+                and right["span"] >= MIN_WALL_SPAN)
+    back_ok  = (back["peak_err"] <= BACK_PEAK_ERR_MAX
+                and back["count"] >= MIN_BACK_COUNT
+                and back["span"] >= MIN_WALL_SPAN)
 
-    frames = []
-    for _ in range(n):
-        try:
-            msg = rospy.wait_for_message('/lidar/points', PointCloud2, timeout=2.0)
-            pts = np.array(list(pc2.read_points(msg, field_names=('x', 'y', 'z'), skip_nans=True)))
-            if len(pts) == 0: continue
+    right["ok"] = right_ok
+    back["ok"]  = back_ok
 
-            # Apply TF if frame_id ≠ base_link AND we have a valid transform
-            fid = msg.header.frame_id
-            if fid and fid != 'base_link' and tf_rot is not None and tf_trans is not None:
-                pts[:, :3] = pts[:, :3] @ tf_rot.T + tf_trans
-            # Also try direct transform if fid varies
-            elif fid and fid != 'base_link':
-                try:
-                    t2 = tf_buffer.lookup_transform('base_link', fid, msg.header.stamp, rospy.Duration(1.0))
-                    dx = t2.transform.translation.x; dy = t2.transform.translation.y; dz = t2.transform.translation.z
-                    q2 = t2.transform.rotation
-                    R2 = tft.quaternion_matrix([q2.x, q2.y, q2.z, q2.w])[:3, :3]
-                    pts[:, :3] = pts[:, :3] @ R2.T + np.array([dx, dy, dz])
-                except:
-                    pass
+    if not (right_ok and back_ok):
+        return {"ok": False, "score": -1e9, "right": right, "back": back}
 
-            r = np.sqrt(pts[:, 0]**2 + pts[:, 1]**2)
-            pts = pts[(r > R_MIN) & (r < R_MAX)]
-            if len(pts) > 0: frames.append(pts)
-            rospy.sleep(0.1)
-        except: continue
-    return frames
+    score = 0.0
+    score += 80.0 if right_ok else -200.0
+    score += 80.0 if back_ok  else -200.0
+    # Peak error penalty — quadratic, dominates
+    score -= 120.0 * (right["peak_err"] / 0.10) ** 2
+    score -= 120.0 * (back["peak_err"]  / 0.10) ** 2
+    # Count bonus — capped, log-scale to prevent domination
+    score += 15.0 * min(right["count"], 1800) / 1800.0
+    score += 15.0 * min(back["count"],  1600) / 1600.0
+    # Span bonus — capped
+    score += 10.0 * min(right["span"], 2.0) / 2.0
+    score += 10.0 * min(back["span"],  2.0) / 2.0
+    return {"ok": True, "score": float(score), "right": right, "back": back}
 
 
 # ═══ Transform ═══
 
-def transform_to_world(pts: np.ndarray, x: float, y: float, yaw: float) -> np.ndarray:
+def transform_to_world(pts, x, y, yaw):
     if len(pts) == 0: return pts
     c, s = math.cos(yaw), math.sin(yaw)
     out = pts.copy()
@@ -182,150 +187,24 @@ def transform_to_world(pts: np.ndarray, x: float, y: float, yaw: float) -> np.nd
     out[:, 1] = pts[:, 0] * s + pts[:, 1] * c + y
     return out
 
-
-def world_to_fix(pts_w: np.ndarray) -> np.ndarray:
+def world_to_fix(pts_w):
     if len(pts_w) == 0: return pts_w
     out = pts_w.copy()
     out[:, 0] -= FIX_X; out[:, 1] -= FIX_Y
     c, s = math.cos(-FIX_YAW), math.sin(-FIX_YAW)
-    x = out[:, 0] * c - out[:, 1] * s
-    y = out[:, 0] * s + out[:, 1] * c
-    out[:, 0], out[:, 1] = x, y
+    out[:, 0] = out[:, 0] * c - out[:, 1] * s
+    out[:, 1] = out[:, 0] * s + out[:, 1] * c
     return out
 
-
-def voxel_downsample(pts: np.ndarray, size: float = VOXEL_SIZE) -> np.ndarray:
+def voxel_downsample(pts, size=VOXEL_SIZE):
     if len(pts) < 2: return pts
     vox = np.floor(pts[:, :3] / size).astype(np.int64)
     _, idx = np.unique(vox, axis=0, return_index=True)
     return pts[idx]
 
 
-# ═══ Strip ═══
+# ═══ Validate ═══
 
-def compute_strip(pts_fix: np.ndarray, target: float,
-                  normal_axis: int, along_axis: int,
-                  min_count: int, min_span: float) -> StripMetrics:
-    sm = StripMetrics()
-    residuals = np.abs(pts_fix[:, normal_axis] - target)
-    in_strip = residuals < STRIP_HALF
-    sm.count = int(np.sum(in_strip))
-    if sm.count < 5: return sm
-
-    strip_pts = pts_fix[in_strip]
-    strip_res = residuals[in_strip]
-    sm.med_residual = float(np.median(strip_res))
-    sm.p90_residual = float(np.percentile(strip_res, 90))
-    sm.span = float(np.max(strip_pts[:, along_axis]) - np.min(strip_pts[:, along_axis]))
-
-    bin_size = 0.1
-    n_bins = max(1, int(sm.span / bin_size))
-    off = np.min(strip_pts[:, along_axis])
-    bins = np.floor((strip_pts[:, along_axis] - off) / bin_size).astype(int)
-    bins = np.clip(bins, 0, n_bins - 1)
-    bin_counts = np.bincount(bins, minlength=n_bins)
-    sm.density_bins = int(np.sum(bin_counts >= 10))
-    sm.ok = (sm.count >= min_count and sm.med_residual <= MAX_MED_RESIDUAL
-             and sm.span >= min_span and sm.density_bins >= MIN_DENSITY_BINS)
-    return sm
-
-
-# ═══ Score ═══
-
-def score_candidate(right: StripMetrics, back: StripMetrics) -> Tuple[float, str]:
-    if not right.ok or not back.ok:
-        parts = []
-        if not right.ok: parts.append(f"RIGHT(n={right.count} med={right.med_residual:.3f} sp={right.span:.2f})")
-        if not back.ok: parts.append(f"BACK(n={back.count} med={back.med_residual:.3f} sp={back.span:.2f})")
-        return 0.0, "; ".join(parts)
-    s = 160.0
-    s += min(right.count, 3000) * 0.01 + min(back.count, 2500) * 0.01
-    s += min(right.span, 2.0) * 10.0 + min(back.span, 2.0) * 10.0
-    s -= 300.0 * right.med_residual + 300.0 * back.med_residual
-    s -= 100.0 * max(0.0, right.p90_residual - 0.12)
-    s -= 100.0 * max(0.0, back.p90_residual - 0.12)
-    return s, ""
-
-
-# ═══ Real candidate acquisition ═══
-
-def get_real_candidates(seed: int, attempt: int, restart_sim: bool = False):
-    """If restart_sim: use SimLauncher to spawn at seed position, then detect.
-    Otherwise: just re-detect (SimLauncher already running from first attempt)."""
-    import rospy, subprocess as sp
-
-    if restart_sim:
-        # Kill any existing processes
-        sp.run(['pkill', '-f', 'rosmaster'], capture_output=True)
-        sp.run(['pkill', '-f', 'roslaunch'], capture_output=True)
-        sp.run(['pkill', '-f', 'nodelet_manager'], capture_output=True)
-        time.sleep(5)
-
-        sys.path.insert(0, '/root/kuavo_ws/src/craic_simulator/utils')
-        sys.path.insert(0, '/root/kuavo_ws/src/craic_simulator/lib')
-        from sim_launcher import SimLauncher
-        launcher = SimLauncher(scene="scene1", seed=seed, robot_version=52)
-        launcher.start(node_name=f"fix_val_s{seed}", timeout=180)
-        print(f"[FIX_VAL] SimLauncher seed={seed} started")
-        time.sleep(8)  # let MuJoCo + TF stabilize
-
-    # Now corner_localizer detection
-    sys.path.insert(0, '/tmp/nav_test')
-    sys.path.insert(0, '/root/kuavo_ws/src/craic_simulator/utils')
-    sys.path.insert(0, '/root/kuavo_ws/src/craic_simulator/lib')
-    import corner_localizer as cl
-
-    xy_vox, xy3_filt, angles, ranges = cl.collect_base_link_cloud(n_frames=N_FRAMES)
-    if xy_vox is None or len(xy_vox) < 30:
-        return [], []
-
-    lines = cl.detect_lines(xy_vox, xy3_filt)
-    if len(lines) < 2: return [], []
-    pairs, _ = cl.find_orthogonal_pairs(lines)
-    if not pairs: return [], []
-
-    all_cands_raw = []
-    for p in pairs:
-        all_cands_raw.extend(cl.generate_candidates_for_pair(p['li'], p['lj'], xy3_filt, angles, ranges))
-    if not all_cands_raw: return [], []
-
-    all_cands_raw.sort(key=lambda c: -c['score'])
-    top20 = all_cands_raw[:20]
-
-    candidates = []
-    for i, c in enumerate(top20):
-        candidates.append(Candidate(id=i, x=c['x'], y=c['y'], yaw=c['yaw'],
-                                    source="corner", orig_score=c['score']))
-
-    # Collect fresh pointcloud frames
-    import tf2_ros, tf.transformations as tft
-    from sensor_msgs.msg import PointCloud2
-    import sensor_msgs.point_cloud2 as pc2
-    tf_buffer = tf2_ros.Buffer()
-    tf_listener = tf2_ros.TransformListener(tf_buffer)
-    rospy.sleep(0.5)
-    tf_trans, tf_rot = None, None
-    try:
-        t = tf_buffer.lookup_transform('base_link', 'radar', rospy.Time(0), rospy.Duration(2.0))
-        tf_trans = np.array([t.transform.translation.x, t.transform.translation.y, t.transform.translation.z])
-        q = t.transform.rotation
-        tf_rot = tft.quaternion_matrix([q.x, q.y, q.z, q.w])[:3, :3]
-    except: pass
-    frames = []
-    for _ in range(N_FRAMES):
-        try:
-            msg = rospy.wait_for_message('/lidar/points', PointCloud2, timeout=2.0)
-            pts = np.array(list(pc2.read_points(msg, field_names=('x', 'y', 'z'), skip_nans=True)))
-            if len(pts) == 0: continue
-            fid = msg.header.frame_id
-            if fid and fid != 'base_link' and tf_rot is not None:
-                pts[:, :3] = pts[:, :3] @ tf_rot.T + tf_trans
-            r = np.sqrt(pts[:, 0]**2 + pts[:, 1]**2)
-            pts = pts[(r > R_MIN) & (r < R_MAX)]
-            if len(pts) > 0: frames.append(pts)
-            rospy.sleep(0.1)
-        except: continue
-    return candidates, frames
 def validate_candidates_at_fix(
     candidates: List[Candidate],
     points_frames: List[np.ndarray],
@@ -339,187 +218,255 @@ def validate_candidates_at_fix(
     for c in candidates:
         p_world = transform_to_world(merged, c.x, c.y, c.yaw)
         p_fix = world_to_fix(p_world)
-        right = compute_strip(p_fix, RIGHT_TARGET, normal_axis=1, along_axis=0,
-                              min_count=MIN_RIGHT_COUNT, min_span=MIN_RIGHT_SPAN)
-        back  = compute_strip(p_fix, BACK_TARGET, normal_axis=0, along_axis=1,
-                              min_count=MIN_BACK_COUNT, min_span=MIN_BACK_SPAN)
-        score, reason = score_candidate(right, back)
-        r = ValidResult(candidate=c, right=right, back=back, fix_score=score, reject_reason=reason)
-        if gt: r.gt_x, r.gt_y, r.gt_yaw = gt
-        results.append(r)
+        r = score_fix_view(p_fix)
 
-    valid = [r for r in results if r.right.ok and r.back.ok]
-    if valid:
-        max(valid, key=lambda r: r.fix_score).selected = True
+        right = WallMetrics(ok=r["right"]["ok"], peak=r["right"]["peak"],
+                            peak_err=r["right"]["peak_err"],
+                            count=r["right"]["count"], med=r["right"]["med"],
+                            p90=r["right"]["p90"], span=r["right"]["span"],
+                            density=r["right"]["density"])
+        back = WallMetrics(ok=r["back"]["ok"], peak=r["back"]["peak"],
+                           peak_err=r["back"]["peak_err"],
+                           count=r["back"]["count"], med=r["back"]["med"],
+                           p90=r["back"]["p90"], span=r["back"]["span"],
+                           density=r["back"]["density"])
+
+        vr = ValidResult(candidate=c, right=right, back=back, fix_score=r["score"])
+        if gt:
+            vr.gt_x, vr.gt_y, vr.gt_yaw = gt
+            vr.gt_ok = (vr.pos_err is not None and vr.pos_err < 0.25
+                        and vr.yaw_err is not None and vr.yaw_err < 0.175)
+        results.append(vr)
+
+    # Select best among those with right_ok AND back_ok
+    wall_ok = [r for r in results if r.right.ok and r.back.ok]
+    if not wall_ok:
+        return results  # all NO_SEL
+
+    # Sort by fix_score descending
+    wall_ok.sort(key=lambda r: -r.fix_score)
+    top1, top2 = wall_ok[0], (wall_ok[1] if len(wall_ok) > 1 else None)
+
+    # AMBIGUOUS check
+    if top2 and (top1.fix_score - top2.fix_score) < MIN_SCORE_MARGIN:
+        for r in results:
+            r.reject_reason = f"AMBIGUOUS: top1={top1.fix_score:.1f} top2={top2.fix_score:.1f} margin={MIN_SCORE_MARGIN}"
+        return results
+
+    top1.selected = True
     return results
+
+
+# ═══ Candidate acquisition ═══
+
+def acquire_candidates_with_simlauncher(seed: int):
+    import rospy, subprocess as sp
+    sp.run(['pkill', '-f', 'rosmaster'], capture_output=True)
+    sp.run(['pkill', '-f', 'roslaunch'], capture_output=True)
+    time.sleep(5)
+    sys.path.insert(0, '/root/kuavo_ws/src/craic_simulator/utils')
+    sys.path.insert(0, '/root/kuavo_ws/src/craic_simulator/lib')
+    from sim_launcher import SimLauncher
+    launcher = SimLauncher(scene="scene1", seed=seed, robot_version=52)
+    launcher.start(node_name=f"v3val_s{seed}", timeout=120)
+    time.sleep(8)
+    sys.path.insert(0, '/tmp/nav_test')
+    import corner_localizer as cl
+    from sensor_msgs.msg import PointCloud2
+    import sensor_msgs.point_cloud2 as pc2
+    import tf2_ros, tf.transformations as tft
+
+    xy_vox, xy3_filt, angles, ranges = cl.collect_base_link_cloud(n_frames=N_FRAMES)
+    if xy_vox is None or len(xy_vox) < 30: return [], [], launcher
+    lines = cl.detect_lines(xy_vox, xy3_filt)
+    if len(lines) < 2: return [], [], launcher
+    pairs, _ = cl.find_orthogonal_pairs(lines)
+    if not pairs: return [], [], launcher
+    all_raw = []
+    for p in pairs:
+        all_raw.extend(cl.generate_candidates_for_pair(p['li'], p['lj'], xy3_filt, angles, ranges))
+    if not all_raw: return [], [], launcher
+    all_raw.sort(key=lambda c: -c['score'])
+    candidates = [Candidate(id=i, x=c['x'], y=c['y'], yaw=c['yaw'], source="corner", orig_score=c['score'])
+                  for i, c in enumerate(all_raw[:20])]
+
+    tf_buffer = tf2_ros.Buffer(); tf_listener = tf2_ros.TransformListener(tf_buffer)
+    rospy.sleep(0.5)
+    tf_trans, tf_rot = None, None
+    try:
+        t = tf_buffer.lookup_transform('base_link', 'radar', rospy.Time(0), rospy.Duration(2.0))
+        tf_trans = np.array([t.transform.translation.x, t.transform.translation.y, t.transform.translation.z])
+        q = t.transform.rotation
+        tf_rot = tft.quaternion_matrix([q.x, q.y, q.z, q.w])[:3, :3]
+    except: pass
+    frames = []
+    for _ in range(N_FRAMES):
+        try:
+            msg = rospy.wait_for_message('/lidar/points', PointCloud2, timeout=2.0)
+            pts = np.array(list(pc2.read_points(msg, field_names=('x','y','z'), skip_nans=True)))
+            if len(pts) == 0: continue
+            fid = msg.header.frame_id
+            if fid and fid != 'base_link' and tf_rot is not None:
+                pts[:, :3] = pts[:, :3] @ tf_rot.T + tf_trans
+            r = np.sqrt(pts[:, 0]**2 + pts[:, 1]**2)
+            pts = pts[(r > R_MIN) & (r < R_MAX)]
+            if len(pts) > 0: frames.append(pts)
+            rospy.sleep(0.1)
+        except: continue
+    return candidates, frames, launcher
 
 
 # ═══ CLI ═══
 
-def main():
+if __name__ == '__main__':
     ap = argparse.ArgumentParser()
-    ap.add_argument('--seed', type=int, default=0)
-    ap.add_argument('--seeds', type=str, default=None)
+    ap.add_argument('--seeds', type=str, default='0,7,13,31,42')
     ap.add_argument('--attempts', type=int, default=3)
     args = ap.parse_args()
 
-    seeds = [args.seed]
-    if args.seeds: seeds = [int(s.strip()) for s in args.seeds.split(',')]
-
+    seeds = [int(s.strip()) for s in args.seeds.split(',')]
     log_dir = '/tmp/nav_test/logs'
     os.makedirs(log_dir, exist_ok=True)
-    csv_path = os.path.join(log_dir, 'fix_validator.csv')
-    jsonl_path = os.path.join(log_dir, 'fix_validator.jsonl')
 
-    cols = ['seed', 'attempt', 'candidate_id', 'source', 'x', 'y', 'yaw_deg',
-            'orig_score', 'right_count', 'right_med', 'right_p90', 'right_span',
-            'right_density', 'right_ok', 'back_count', 'back_med', 'back_p90',
-            'back_span', 'back_density', 'back_ok', 'fix_score', 'selected',
-            'reject_reason', 'gt_x', 'gt_y', 'gt_yaw_deg', 'pos_err', 'yaw_err_deg']
+    COLS = ['seed','attempt','candidate_id','source','x','y','yaw_deg','orig_score',
+            'right_peak','right_peak_err','right_count','right_ok',
+            'back_peak','back_peak_err','back_count','back_ok',
+            'fix_score','selected','reject_reason','gt_ok',
+            'gt_x','gt_y','gt_yaw_deg','pos_err','yaw_err_deg']
 
-    all_rows, correct, total = [], 0, 0
-
-    # Import once for GT_POSES
     sys.path.insert(0, '/tmp/nav_test')
     import corner_localizer as cl_ref
     GT_POSES = getattr(cl_ref, 'GT_POSES', {})
 
-    for seed in seeds:
-        for a in range(args.attempts):
-            cands, frames = get_real_candidates(seed, a + 1)
-            if len(frames) < 3 or not cands:
-                print(f"  seed={seed} attempt={a+1}: frames={len(frames)} cands={len(cands)} SKIP")
-                continue
-
-            gt = GT_POSES.get(seed, None)
-            results = validate_candidates_at_fix(cands, frames, gt)
-            total += 1
-
-            sel = [r for r in results if r.selected]
-            print(f"\n── seed={seed} attempt={a+1}  {len(results)} candidates  "
-                  f"selected={'#'+str(sel[0].candidate.id) if sel else 'NONE'} ──")
-
-            for r in results:
-                all_rows.append(r.row_dict(seed, a + 1))
-                mark = " ★" if r.selected else ""
-                perr = f"pos={r.pos_err:.3f}" if r.pos_err else ""
-                yerr = f"yaw={math.degrees(r.yaw_err):.1f}°" if r.yaw_err else ""
-                print(f"  [{r.candidate.id}] R(n={r.right.count} med={r.right.med_residual:.3f} "
-                      f"sp={r.right.span:.2f} ok={r.right.ok})  "
-                      f"B(n={r.back.count} med={r.back.med_residual:.3f} "
-                      f"sp={r.back.span:.2f} ok={r.back.ok})  "
-                      f"score={r.fix_score:.1f}  {perr} {yerr}{mark}")
-
-            if sel:
-                best = sel[0]
-                if best.pos_err is not None and best.yaw_err is not None:
-                    if best.pos_err < 0.25 and best.yaw_err < 0.17:
-                        correct += 1
-            else:
-                print(f"  ⚠ NO CANDIDATE PASSED both right_ok AND back_ok — FAIL")
-                print(f"  Failure analysis:")
-                for r in results:
-                    print(f"    [{r.candidate.id}] right_ok={r.right.ok} back_ok={r.back.ok} "
-                          f"R(n={r.right.count} med={r.right.med_residual:.3f} sp={r.right.span:.2f}) "
-                          f"B(n={r.back.count} med={r.back.med_residual:.3f} sp={r.back.span:.2f})")
-
-    with open(csv_path, 'w', newline='') as f:
-        w = csv.DictWriter(f, fieldnames=cols, extrasaction='ignore')
-        w.writeheader(); w.writerows(all_rows)
-    with open(jsonl_path, 'w') as f:
-        for row in all_rows: f.write(json.dumps(row) + '\n')
-
-    print(f"\n{'='*60}")
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument('--seed', type=int, default=0)
-    ap.add_argument('--seeds', type=str, default=None)
-    ap.add_argument('--attempts', type=int, default=3)
-    args = ap.parse_args()
-
-    seeds = [args.seed]
-    if args.seeds: seeds = [int(s.strip()) for s in args.seeds.split(',')]
-
-    log_dir = '/tmp/nav_test/logs'
-    os.makedirs(log_dir, exist_ok=True)
-    csv_path = os.path.join(log_dir, 'fix_validator.csv')
-    jsonl_path = os.path.join(log_dir, 'fix_validator.jsonl')
-
-    cols = ['seed', 'attempt', 'candidate_id', 'source', 'x', 'y', 'yaw_deg',
-            'orig_score', 'right_count', 'right_med', 'right_p90', 'right_span',
-            'right_density', 'right_ok', 'back_count', 'back_med', 'back_p90',
-            'back_span', 'back_density', 'back_ok', 'fix_score', 'selected',
-            'reject_reason', 'gt_x', 'gt_y', 'gt_yaw_deg', 'pos_err', 'yaw_err_deg']
-
-    all_rows, correct, total = [], 0, 0
-
-    # Import once for GT_POSES
-    sys.path.insert(0, '/tmp/nav_test')
-    import corner_localizer as cl_ref
-    GT_POSES = getattr(cl_ref, 'GT_POSES', {})
+    all_rows = []
+    total_correct_selected = 0
+    total_miss = 0      # CANDIDATE_MISS: no gt_ok candidate
+    total_misselect = 0 # VALIDATOR_MISSELECT: gt_ok exists but selected wrong
 
     for seed in seeds:
-        # Restart simulation at this seed position (first attempt)
-        cands, frames = get_real_candidates(seed, 1, restart_sim=True)
+        print(f"\n{'─'*50}\nSEED {seed}\n{'─'*50}")
+        cands, frames, launcher = acquire_candidates_with_simlauncher(seed)
+        gt = GT_POSES.get(seed)
+        if gt: print(f"GT: ({gt[0]:.3f}, {gt[1]:.3f}, {math.degrees(gt[2]):.0f}°)")
 
         for a in range(args.attempts):
             if a > 0:
-                # Subsequent attempts: re-detect without restarting sim
-                cands, frames = get_real_candidates(seed, a + 1, restart_sim=False)
+                import rospy
+                from sensor_msgs.msg import PointCloud2
+                import sensor_msgs.point_cloud2 as pc2
+                import tf2_ros, tf.transformations as tft
+                import corner_localizer as cl2
+
+                xy2, xy32, ang2, ran2 = cl2.collect_base_link_cloud(n_frames=N_FRAMES)
+                if xy2 is None or len(xy2) < 30: continue
+                lines2 = cl2.detect_lines(xy2, xy32)
+                if len(lines2) < 2: continue
+                pairs2, _ = cl2.find_orthogonal_pairs(lines2)
+                if not pairs2: continue
+                allr2 = []
+                for p in pairs2:
+                    allr2.extend(cl2.generate_candidates_for_pair(p['li'], p['lj'], xy32, ang2, ran2))
+                if not allr2: continue
+                allr2.sort(key=lambda c: -c['score'])
+                cands = [Candidate(id=i, x=c['x'], y=c['y'], yaw=c['yaw'], source="corner", orig_score=c['score'])
+                         for i, c in enumerate(allr2[:20])]
+
+                tf_buf = tf2_ros.Buffer(); tf_lis = tf2_ros.TransformListener(tf_buf)
+                rospy.sleep(0.5)
+                tf_trans, tf_rot = None, None
+                try:
+                    t = tf_buf.lookup_transform('base_link', 'radar', rospy.Time(0), rospy.Duration(2.0))
+                    tf_trans = np.array([t.transform.translation.x, t.transform.translation.y, t.transform.translation.z])
+                    q = t.transform.rotation
+                    tf_rot = tft.quaternion_matrix([q.x, q.y, q.z, q.w])[:3, :3]
+                except: pass
+                frames = []
+                for _ in range(N_FRAMES):
+                    try:
+                        msg = rospy.wait_for_message('/lidar/points', PointCloud2, timeout=2.0)
+                        pts = np.array(list(pc2.read_points(msg, field_names=('x','y','z'), skip_nans=True)))
+                        r = np.sqrt(pts[:,0]**2+pts[:,1]**2)
+                        pts = pts[(r>0.35)&(r<20)]
+                        if len(pts)>0: frames.append(pts)
+                        rospy.sleep(0.1)
+                    except: continue
+                if len(frames) < 3: continue
 
             if len(frames) < 3 or not cands:
-                print(f"  seed={seed} attempt={a+1}: frames={len(frames)} cands={len(cands)} SKIP")
+                print(f"  A{a+1} SKIP")
                 continue
 
-            gt = GT_POSES.get(seed, None)
             results = validate_candidates_at_fix(cands, frames, gt)
-            total += 1
-
             sel = [r for r in results if r.selected]
-            print(f"\n── seed={seed} attempt={a+1}  {len(results)} candidates  "
-                  f"selected={'#'+str(sel[0].candidate.id) if sel else 'NONE'} ──")
+            gt_ok_cands = [r for r in results if r.gt_ok]
+            n_gt_ok = len(gt_ok_cands)
+            n_cands = len(cands)
+            sel_id = sel[0].candidate.id if sel else None
+            sel_correct = sel and sel[0].gt_ok
+
+            # Classification
+            if n_gt_ok == 0:
+                tag = "CANDIDATE_MISS"
+                total_miss += 1
+            elif sel_correct:
+                tag = "CORRECT"
+                total_correct_selected += 1
+            elif sel:
+                tag = "VALIDATOR_MISSELECT"
+                total_misselect += 1
+            else:
+                tag = "NO_SEL"
+                total_misselect += 1  # gt_ok exists but validator didn't pick anything
+
+            mark = "✓" if sel_correct else "✗"
+            print(f"  A{a+1} {tag}  n_cands={n_cands} gt_ok={n_gt_ok}  "
+                  f"sel={'#'+str(sel_id) if sel_id is not None else 'NONE'}  {mark}")
 
             for r in results:
                 all_rows.append(r.row_dict(seed, a + 1))
-                mark = " ★" if r.selected else ""
-                perr = f"pos={r.pos_err:.3f}" if r.pos_err else ""
-                yerr = f"yaw={math.degrees(r.yaw_err):.1f}°" if r.yaw_err else ""
-                print(f"  [{r.candidate.id}] R(n={r.right.count} med={r.right.med_residual:.3f} "
-                      f"sp={r.right.span:.2f} ok={r.right.ok})  "
-                      f"B(n={r.back.count} med={r.back.med_residual:.3f} "
-                      f"sp={r.back.span:.2f} ok={r.back.ok})  "
-                      f"score={r.fix_score:.1f}  {perr} {yerr}{mark}")
 
-            if sel:
-                best = sel[0]
-                if best.pos_err is not None and best.yaw_err is not None:
-                    if best.pos_err < 0.25 and best.yaw_err < 0.17:
-                        correct += 1
-            else:
-                print(f"  ⚠ NO CANDIDATE PASSED both right_ok AND back_ok — FAIL")
-                print(f"  Failure analysis:")
-                for r in results:
-                    print(f"    [{r.candidate.id}] right_ok={r.right.ok} back_ok={r.back.ok} "
-                          f"R(n={r.right.count} med={r.right.med_residual:.3f} sp={r.right.span:.2f}) "
-                          f"B(n={r.back.count} med={r.back.med_residual:.3f} sp={r.back.span:.2f})")
+            # Failure detail
+            if not sel_correct:
+                if sel:
+                    s = sel[0]
+                    print(f"    [SELECTED C{s.candidate.id}] pos_err={s.pos_err:.3f}m/{math.degrees(s.yaw_err):.1f}°  "
+                          f"R(peak={s.right.peak:.3f} err={s.right.peak_err:.3f} n={s.right.count} ok={s.right.ok})  "
+                          f"B(peak={s.back.peak:.3f} err={s.back.peak_err:.3f} n={s.back.count} ok={s.back.ok})  "
+                          f"score={s.fix_score:.1f}")
+                if n_gt_ok > 0:
+                    best = min(gt_ok_cands, key=lambda r: r.pos_err)
+                    print(f"    [BEST_GT C{best.candidate.id}] pos_err={best.pos_err:.3f}m/{math.degrees(best.yaw_err):.1f}°  "
+                          f"R(peak={best.right.peak:.3f} err={best.right.peak_err:.3f} n={best.right.count} ok={best.right.ok})  "
+                          f"B(peak={best.back.peak:.3f} err={best.back.peak_err:.3f} n={best.back.count} ok={best.back.ok})  "
+                          f"score={best.fix_score:.1f}")
+                elif not sel:
+                    # Show top by score
+                    top = max(results, key=lambda r: r.fix_score)
+                    print(f"    [TOP C{top.candidate.id}] "
+                          f"R(peak={top.right.peak:.3f} err={top.right.peak_err:.3f} n={top.right.count} ok={top.right.ok})  "
+                          f"B(peak={top.back.peak:.3f} err={top.back.peak_err:.3f} n={top.back.count} ok={top.back.ok})  "
+                          f"score={top.fix_score:.1f}")
 
-        # Kill sim before next seed
-        import subprocess as sp
-        sp.run(['pkill', '-f', 'rosmaster'], capture_output=True)
-        sp.run(['pkill', '-f', 'roslaunch'], capture_output=True)
-        sp.run(['pkill', '-f', 'nodelet_manager'], capture_output=True)
+        launcher.stop()
         time.sleep(5)
 
-    with open(csv_path, 'w', newline='') as f:
-        w = csv.DictWriter(f, fieldnames=cols, extrasaction='ignore')
-        w.writeheader(); w.writerows(all_rows)
-    with open(jsonl_path, 'w') as f:
-        for row in all_rows: f.write(json.dumps(row) + '\n')
+    # ═══ Summary ═══
+    print("\n" + "=" * 70)
+    print("SUMMARY (v3: geometric-first + AMBIGUOUS rejection)")
+    print("=" * 70)
+    print(f"total_correct_selected:   {total_correct_selected}")
+    print(f"candidate_miss:           {total_miss}")
+    print(f"validator_misselect:      {total_misselect}")
+    n_attempts = total_correct_selected + total_miss + total_misselect
+    print(f"total_attempts:           {n_attempts}")
+    print(f"Target: correct≥13/15, miss+misselect minimal")
 
-    print(f"\n{'='*60}")
-    if total:
-        print(f"  ACCURACY: {correct}/{total}  (pos_err<0.25m & yaw_err<10°)")
-    print(f"  Total tests: {total}  Logs: {csv_path}  {jsonl_path}")
-    print(f"{'='*60}")
-if __name__ == '__main__':
-    main()
+    # Write logs
+    csv_path = os.path.join(log_dir, 'v3_validator.csv')
+    jl_path = os.path.join(log_dir, 'v3_validator.jsonl')
+    with open(csv_path, 'w', newline='') as f:
+        w = csv.DictWriter(f, fieldnames=COLS, extrasaction='ignore')
+        w.writeheader(); w.writerows(all_rows)
+    with open(jl_path, 'w') as f:
+        for r in all_rows: f.write(json.dumps(r) + '\n')
+    print(f"Logs: {jl_path}  ({len(all_rows)} rows)")
